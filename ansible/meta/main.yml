@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: githubrepomanager
+  author: GitHub Copilot
+  description: GitHubRepoManager role
+  company: Personal
+  license: MIT
+  min_ansible_version: 2.9
+  platforms:
+    - name: RHEL
+      versions:
+        - 9

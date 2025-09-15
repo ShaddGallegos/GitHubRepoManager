@@ -1,0 +1,37 @@
+---
+- name: Clone all repositories for a GitHub user
+  hosts: localhost
+  vars_prompt:
+    - name: github_user
+      prompt: Enter the GitHub username
+      private: false
+    - name: target_dir
+      prompt: Enter the target directory to save repositories
+      private: false
+      default: "{{ lookup('env', 'HOME') + '/Downloads/GIT' }}"
+  tasks:
+    - name: Fetch the list of repositories
+      uri:
+        url: "https://api.github.com/users/{{ github_user }}/repos"
+        return_content: true
+      register: repos
+
+    - name: Parse the repository URLs
+      set_fact:
+        repo_urls: "{{ repos.json | map(attribute='clone_url') | list }}"
+
+    - name: Ensure destination directory exists
+      file:
+        path: "{{ target_dir }}"
+        state: directory
+
+    - name: Clone repositories
+      git:
+        repo: "{{ item }}"
+        dest: "{{ target_dir }}/{{ item | basename | replace('.git', '') }}"
+      loop: "{{ repo_urls }}"
+
+    - name: Report cloned repositories
+      debug:
+        msg: "Cloned repository {{ item }}"
+      loop: "{{ repo_urls }}"

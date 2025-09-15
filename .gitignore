@@ -1,0 +1,48 @@
+# Ansible generated files
+ansible.cfg
+*.retry
+
+# Credentials and secrets
+env.yml
+*.vault
+vault.yml
+vault.yaml
+
+# Backup files
+*backup*/
+*backup*
+*BACKUP*/
+*BACKUP*
+*Backup*/
+*Backup*
+*bak*/
+*bak
+*.bak
+*.BAK
+*~
+*.old
+*.orig
+*.swp
+*.swo
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# OS specific
+.DS_Store
+Thumbs.db
+.directory
+
