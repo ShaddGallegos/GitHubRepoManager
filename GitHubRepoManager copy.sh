@@ -18,7 +18,6 @@
 # - Automatic git configuration setup
 # - Unrelated histories and merge conflict resolution
 # - Dry-run mode for batch operations
-# - Auto-detection of template variables and README passwords for --no-verify commits
 #
 # Usage:
 #   ./GitHubRepoManager.sh [--help] [--create] [--delete] [--fix] [--auto-commit] [--protect] [--manage-pr] [--ga-cleanup] [--restore]
@@ -37,9 +36,7 @@
 # Author: GitHub Repository Manager v4.2.1
 # Date: September 5, 2025
 
-# reset
-
-# set -eo pipefail
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -52,615 +49,6 @@ print_status() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-# Function to check folders for git repositories
-check_folders_for_git_repos() {
-  echo ""
-  print_status "Scanning for folders that are NOT git repositories..."
-  local base_path
-  read -p "Enter base path to scan (default: current directory): " base_path
-  base_path="${base_path:-.}"
-
-  if [[ ! -d "$base_path" ]]; then
-    print_error "Directory not found: $base_path"
-    return 1
-  fi
-
-  cd "$base_path" || return 1
-
-  local non_git_folders=()
-  for dir in */; do
-    dir="${dir%/}"
-    # Skip hidden folders
-    [[ "$dir" =~ ^\..* ]] && continue
-    # Skip if .git exists
-    if [[ ! -d "$dir/.git" ]]; then
-      non_git_folders+=("$dir")
-    fi
-  done
-
-  if [[ ${#non_git_folders[@]} -eq 0 ]]; then
-    print_success "All folders are git repositories."
-    return 0
-  fi
-
-  echo ""
-  print_status "Folders that are NOT git repositories:"
-  local i=1
-  for folder in "${non_git_folders[@]}"; do
-    echo "$i) $folder"
-    ((i++))
-  done
-
-  echo ""
-  read -p "Enter the number(s) of the folder(s) to create as new GitHub repos (comma-separated, or 'all'): " selection
-
-  if [[ "$selection" == "all" ]]; then
-    selected_indices=($(seq 1 ${#non_git_folders[@]}))
-  else
-    IFS=',' read -ra selected_indices <<< "$selection"
-  fi
-
-  for idx in "${selected_indices[@]}"; do
-    folder="${non_git_folders[$((idx-1))]}"
-    if [[ -n "$folder" ]]; then
-      echo ""
-      print_status "Creating new GitHub repository for: $folder"
-      # Use the full path automatically
-      create_repository_with_path "$base_path/$folder"
-    fi
-  done
-}
-
-# Function to scan for local git repositories needing push
-scan_and_push_git_repos() {
-  echo ""
-  print_status "Scanning for local git repositories that need to be pushed..."
-  local base_path
-  read -p "Enter base path to scan (default: current directory): " base_path
-  base_path="${base_path:-.}"
-
-  if [[ ! -d "$base_path" ]]; then
-    print_error "Directory not found: $base_path"
-    return 1
-  fi
-
-  cd "$base_path" || return 1
-
-  local repos_needing_push=()
-  local repos_with_changes=()
-  local total_repos=0
-
-  # Find all git repositories
-  while IFS= read -r -d '' git_dir; do
-    repo_path=$(dirname "$git_dir")
-    repo_name=$(basename "$repo_path")
-    ((total_repos++))
-    
-    cd "$repo_path" 2>/dev/null || continue
-    
-    # Check for uncommitted changes
-    local has_uncommitted=false
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-      has_uncommitted=true
-      repos_with_changes+=("$repo_path")
-    fi
-    
-    # Check for unpushed commits
-    local has_unpushed=false
-    local remote_branch=""
-    local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    
-    if [[ -n "$current_branch" && "$current_branch" != "HEAD" ]]; then
-      remote_branch=$(git rev-parse --abbrev-ref "$current_branch@{upstream}" 2>/dev/null || echo "")
-      if [[ -n "$remote_branch" ]]; then
-        local ahead_count=$(git rev-list --count "$remote_branch..$current_branch" 2>/dev/null || echo "0")
-        if [[ "$ahead_count" -gt 0 ]]; then
-          has_unpushed=true
-        fi
-      else
-        # No upstream branch set, likely needs initial push
-        if [[ $(git rev-list --count HEAD 2>/dev/null || echo "0") -gt 0 ]]; then
-          has_unpushed=true
-        fi
-      fi
-    fi
-    
-    if [[ "$has_uncommitted" == "true" || "$has_unpushed" == "true" ]]; then
-      local status_info=""
-      [[ "$has_uncommitted" == "true" ]] && status_info+="uncommitted changes"
-      [[ "$has_uncommitted" == "true" && "$has_unpushed" == "true" ]] && status_info+=", "
-      [[ "$has_unpushed" == "true" ]] && status_info+="unpushed commits"
-      repos_needing_push+=("$repo_path|$status_info")
-    fi
-    
-    cd "$base_path" || return 1
-  done < <(find "$base_path" -name ".git" -type d -print0 2>/dev/null)
-
-  print_status "Scan complete: Found $total_repos git repositories"
-  
-  if [[ ${#repos_needing_push[@]} -eq 0 ]]; then
-    print_success "All git repositories are up to date!"
-    return 0
-  fi
-
-  echo ""
-  print_status "Repositories needing attention (${#repos_needing_push[@]} found):"
-  local i=1
-  for repo_info in "${repos_needing_push[@]}"; do
-    IFS='|' read -r repo_path status_info <<< "$repo_info"
-    repo_name=$(basename "$repo_path")
-    echo "$i) $repo_name ($status_info)"
-    echo "   Path: $repo_path"
-    ((i++))
-  done
-
-  echo ""
-  echo "Actions available:"
-  echo "1) Auto-commit and push selected repositories"
-  echo "2) Show detailed status for selected repositories"
-  echo "3) Generate comprehensive report (needs update vs up-to-date)"
-  echo "4) Return to main menu"
-  echo ""
-  read -p "Choose action (1-4): " action
-  
-  case $action in
-    1)
-      echo ""
-      read -p "Enter repository numbers to commit and push (comma-separated, or 'all'): " selection
-      
-      if [[ "$selection" == "all" ]]; then
-        selected_indices=($(seq 1 ${#repos_needing_push[@]}))
-      else
-        IFS=',' read -ra selected_indices <<< "$selection"
-      fi
-      
-      read -p "Enter commit message for repositories with changes [Auto-commit from scan]: " commit_msg
-      commit_msg=${commit_msg:-"Auto-commit from scan"}
-      
-      local success_count=0
-      local failed_count=0
-      
-      for idx in "${selected_indices[@]}"; do
-        repo_info="${repos_needing_push[$((idx-1))]}"
-        if [[ -n "$repo_info" ]]; then
-          IFS='|' read -r repo_path status_info <<< "$repo_info"
-          repo_name=$(basename "$repo_path")
-          
-          echo ""
-          print_status "Processing: $repo_name"
-          cd "$repo_path" 2>/dev/null || continue
-          
-          # Handle uncommitted changes
-          if [[ "$status_info" == *"uncommitted changes"* ]]; then
-            print_status "Adding and committing changes..."
-            if git add --all 2>/dev/null; then
-              local commit_cmd="git commit -m \"$commit_msg\""
-              if should_use_no_verify "$(pwd)"; then
-                commit_cmd="git commit --no-verify -m \"$commit_msg\""
-                print_status "Using --no-verify due to template variables or README passwords detected"
-              fi
-              
-              if eval "$commit_cmd" 2>/dev/null; then
-                print_success "Changes committed for: $repo_name"
-              else
-                print_error "Failed to commit changes for: $repo_name"
-                ((failed_count++))
-                continue
-              fi
-            else
-              print_error "Failed to add files for: $repo_name"
-              ((failed_count++))
-              continue
-            fi
-          fi
-          
-          # Handle push
-          if [[ "$status_info" == *"unpushed commits"* ]]; then
-            print_status "Pushing commits..."
-            if git push 2>/dev/null || git push --set-upstream origin $(git rev-parse --abbrev-ref HEAD) 2>/dev/null; then
-              print_success "Successfully pushed: $repo_name"
-              ((success_count++))
-            else
-              print_error "Failed to push: $repo_name"
-              ((failed_count++))
-            fi
-          else
-            ((success_count++))
-          fi
-        fi
-      done
-      
-      echo ""
-      print_status "Operation complete:"
-      echo "  Successful: $success_count"
-      echo "  Failed: $failed_count"
-      ;;
-      
-    2)
-      echo ""
-      read -p "Enter repository numbers to show status (comma-separated, or 'all'): " selection
-      
-      if [[ "$selection" == "all" ]]; then
-        selected_indices=($(seq 1 ${#repos_needing_push[@]}))
-      else
-        IFS=',' read -ra selected_indices <<< "$selection"
-      fi
-      
-      for idx in "${selected_indices[@]}"; do
-        repo_info="${repos_needing_push[$((idx-1))]}"
-        if [[ -n "$repo_info" ]]; then
-          IFS='|' read -r repo_path status_info <<< "$repo_info"
-          repo_name=$(basename "$repo_path")
-          
-          echo ""
-          echo "=========================================="
-          print_status "Repository: $repo_name"
-          echo "Path: $repo_path"
-          echo "Status: $status_info"
-          echo ""
-          
-          cd "$repo_path" || continue
-          
-          # Show git status
-          echo "Git Status:"
-          git status --short 2>/dev/null || echo "Could not get git status"
-          
-          # Show unpushed commits if any
-          local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-          local remote_branch=$(git rev-parse --abbrev-ref "$current_branch@{upstream}" 2>/dev/null || echo "")
-          if [[ -n "$remote_branch" ]]; then
-            local ahead_count=$(git rev-list --count "$remote_branch..$current_branch" 2>/dev/null || echo "0")
-            if [[ "$ahead_count" -gt 0 ]]; then
-              echo ""
-              echo "Unpushed commits ($ahead_count):"
-              git log --oneline "$remote_branch..$current_branch" 2>/dev/null | head -5
-              [[ "$ahead_count" -gt 5 ]] && echo "... and $((ahead_count - 5)) more commits"
-            fi
-          fi
-          echo "=========================================="
-        fi
-      done
-      ;;
-      
-    3)
-      # Generate comprehensive report
-      echo ""
-      print_status "Generating Repository Status Report..."
-      
-      # Get current timestamp for report
-      local report_timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-      local report_file="/tmp/git_repo_report_$(date +%Y%m%d_%H%M%S).txt"
-      
-      # Create report header
-      cat > "$report_file" << EOF
-========================================
-Git Repository Status Report
-Generated: $report_timestamp
-Scan Path: $base_path
-========================================
-
-SUMMARY:
-- Total repositories scanned: $total_repos
-- Repositories needing updates: ${#repos_needing_push[@]}
-- Repositories up-to-date: $((total_repos - ${#repos_needing_push[@]}))
-
-EOF
-
-      echo ""
-      echo "Report Summary:"
-      echo "- Total repositories scanned: $total_repos"
-      echo "- Repositories needing updates: ${#repos_needing_push[@]}"
-      echo "- Repositories up-to-date: $((total_repos - ${#repos_needing_push[@]}))"
-      
-      # Add repositories needing updates
-      if [[ ${#repos_needing_push[@]} -gt 0 ]]; then
-        cat >> "$report_file" << EOF
-
-REPOSITORIES NEEDING UPDATES:
-EOF
-        
-        echo ""
-        print_status "Repositories needing updates:"
-        
-        for repo_info in "${repos_needing_push[@]}"; do
-          IFS='|' read -r repo_path status_info <<< "$repo_info"
-          repo_name=$(basename "$repo_path")
-          
-          echo "[NEEDS UPDATE] $repo_name - $status_info"
-          echo "[NEEDS UPDATE] $repo_name - $status_info" >> "$report_file"
-          echo "   Path: $repo_path" >> "$report_file"
-          
-          # Get more detailed info for report
-          cd "$repo_path" || continue
-          
-          # Count uncommitted files
-          local uncommitted_count=0
-          if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-            uncommitted_count=$(git status --porcelain 2>/dev/null | wc -l)
-          fi
-          
-          # Count unpushed commits
-          local unpushed_count=0
-          local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-          if [[ -n "$current_branch" && "$current_branch" != "HEAD" ]]; then
-            local remote_branch=$(git rev-parse --abbrev-ref "$current_branch@{upstream}" 2>/dev/null || echo "")
-            if [[ -n "$remote_branch" ]]; then
-              unpushed_count=$(git rev-list --count "$remote_branch..$current_branch" 2>/dev/null || echo "0")
-            elif [[ $(git rev-list --count HEAD 2>/dev/null || echo "0") -gt 0 ]]; then
-              unpushed_count=$(git rev-list --count HEAD 2>/dev/null || echo "0")
-            fi
-          fi
-          
-          echo "   Branch: $current_branch" >> "$report_file"
-          [[ $uncommitted_count -gt 0 ]] && echo "   Uncommitted files: $uncommitted_count" >> "$report_file"
-          [[ $unpushed_count -gt 0 ]] && echo "   Unpushed commits: $unpushed_count" >> "$report_file"
-          echo "" >> "$report_file"
-          
-          cd "$base_path" || return 1
-        done
-      fi
-      
-      # Add up-to-date repositories
-      cat >> "$report_file" << EOF
-
-REPOSITORIES UP-TO-DATE:
-EOF
-      
-      echo ""
-      print_status "Repositories up-to-date:"
-      
-      # Find all repos and determine which are up-to-date
-      while IFS= read -r -d '' git_dir; do
-        repo_path=$(dirname "$git_dir")
-        repo_name=$(basename "$repo_path")
-        
-        # Check if this repo is in the "needs push" list
-        local needs_update=false
-        for repo_info in "${repos_needing_push[@]}"; do
-          IFS='|' read -r check_path status_info <<< "$repo_info"
-          if [[ "$check_path" == "$repo_path" ]]; then
-            needs_update=true
-            break
-          fi
-        done
-        
-        if [[ "$needs_update" == "false" ]]; then
-          echo "[UP-TO-DATE] $repo_name - No updates required"
-          echo "[UP-TO-DATE] $repo_name - No updates required" >> "$report_file"
-          echo "   Path: $repo_path" >> "$report_file"
-          
-          cd "$repo_path" || continue
-          local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-          local last_commit=$(git log -1 --format="%h - %s (%cr)" 2>/dev/null || echo "No commits")
-          
-          echo "   Branch: $current_branch" >> "$report_file"
-          echo "   Last commit: $last_commit" >> "$report_file"
-          echo "" >> "$report_file"
-          
-          cd "$base_path" || return 1
-        fi
-      done < <(find "$base_path" -name ".git" -type d -print0 2>/dev/null)
-      
-      # Add report footer
-      cat >> "$report_file" << EOF
-
-========================================
-End of Report
-Generated by: GitHub Repository Manager
-========================================
-EOF
-      
-      echo ""
-      print_success "Report generated successfully!"
-      echo "Report saved to: $report_file"
-      
-      read -p "Do you want to view the report now? [y/N]: " view_report
-      if [[ "$view_report" =~ ^[Yy]$ ]]; then
-        echo ""
-        echo "=========================================="
-        cat "$report_file"
-        echo "=========================================="
-      fi
-      
-      read -p "Do you want to save the report to a custom location? [y/N]: " save_custom
-      if [[ "$save_custom" =~ ^[Yy]$ ]]; then
-        read -p "Enter full path for report file: " custom_path
-        if [[ -n "$custom_path" ]]; then
-          if cp "$report_file" "$custom_path" 2>/dev/null; then
-            print_success "Report saved to: $custom_path"
-          else
-            print_error "Failed to save report to: $custom_path"
-            print_info "Report remains available at: $report_file"
-          fi
-        fi
-      fi
-      ;;
-      
-    4)
-      print_status "Returning to main menu..."
-      return 0
-      ;;
-      
-    *)
-      print_error "Invalid selection"
-      return 1
-      ;;
-  esac
-}
-
-# Function to generate a quick status report for all repositories
-generate_repository_report() {
-  echo ""
-  print_status "Generating Quick Repository Status Report..."
-  local base_path
-  read -p "Enter base path to scan (default: current directory): " base_path
-  base_path="${base_path:-.}"
-
-  if [[ ! -d "$base_path" ]]; then
-    print_error "Directory not found: $base_path"
-    return 1
-  fi
-
-  cd "$base_path" || return 1
-
-  local total_repos=0
-  local needs_update=0
-  local up_to_date=0
-  local report_timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-  
-  echo ""
-  echo "=========================================="
-  echo "Git Repository Status Report"
-  echo "Generated: $report_timestamp"
-  echo "Scan Path: $base_path"
-  echo "=========================================="
-  
-  # Create arrays to store results
-  local needs_update_list=()
-  local up_to_date_list=()
-
-  # Scan all git repositories
-  while IFS= read -r -d '' git_dir; do
-    repo_path=$(dirname "$git_dir")
-    repo_name=$(basename "$repo_path")
-    ((total_repos++))
-    
-    cd "$repo_path" 2>/dev/null || continue
-    
-    # Check for changes
-    local has_changes=false
-    local status_info=""
-    
-    # Check for uncommitted changes
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-      has_changes=true
-      local uncommitted_count=$(git status --porcelain 2>/dev/null | wc -l)
-      status_info+="$uncommitted_count uncommitted files"
-    fi
-    
-    # Check for unpushed commits
-    local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    if [[ -n "$current_branch" && "$current_branch" != "HEAD" ]]; then
-      local remote_branch=$(git rev-parse --abbrev-ref "$current_branch@{upstream}" 2>/dev/null || echo "")
-      if [[ -n "$remote_branch" ]]; then
-        local ahead_count=$(git rev-list --count "$remote_branch..$current_branch" 2>/dev/null || echo "0")
-        if [[ "$ahead_count" -gt 0 ]]; then
-          has_changes=true
-          [[ -n "$status_info" ]] && status_info+=", "
-          status_info+="$ahead_count unpushed commits"
-        fi
-      elif [[ $(git rev-list --count HEAD 2>/dev/null || echo "0") -gt 0 ]]; then
-        has_changes=true
-        [[ -n "$status_info" ]] && status_info+=", "
-        local commit_count=$(git rev-list --count HEAD 2>/dev/null || echo "0")
-        status_info+="$commit_count commits (no upstream)"
-      fi
-    fi
-    
-    if [[ "$has_changes" == "true" ]]; then
-      ((needs_update++))
-      needs_update_list+=("$repo_name|$repo_path|$status_info")
-    else
-      ((up_to_date++))
-      local last_commit=$(git log -1 --format="%h - %s (%cr)" 2>/dev/null || echo "No commits")
-      up_to_date_list+=("$repo_name|$repo_path|$current_branch|$last_commit")
-    fi
-    
-    cd "$base_path" || return 1
-  done < <(find "$base_path" -name ".git" -type d -print0 2>/dev/null)
-
-  # Display summary
-  echo ""
-  echo "SUMMARY:"
-  echo "- Total repositories: $total_repos"
-  echo "- Need updates: $needs_update"
-  echo "- Up-to-date: $up_to_date"
-  
-  # Show repositories needing updates
-  if [[ $needs_update -gt 0 ]]; then
-    echo ""
-    echo "REPOSITORIES NEEDING UPDATES:"
-    echo "----------------------------------------"
-    for repo_info in "${needs_update_list[@]}"; do
-      IFS='|' read -r name path status <<< "$repo_info"
-      echo "[NEEDS UPDATE] $name"
-      echo "   Status: $status"
-      echo "   Path: $path"
-      echo ""
-    done
-  fi
-  
-  # Show up-to-date repositories  
-  if [[ $up_to_date -gt 0 ]]; then
-    echo ""
-    echo "REPOSITORIES UP-TO-DATE:"
-    echo "----------------------------------------"
-    for repo_info in "${up_to_date_list[@]}"; do
-      IFS='|' read -r name path branch last_commit <<< "$repo_info"
-      echo "[UP-TO-DATE] $name"
-      echo "   Branch: $branch"
-      echo "   Last: $last_commit"
-      echo "   Path: $path"
-      echo ""
-    done
-  fi
-  
-  echo "=========================================="
-  
-  # Option to save report
-  echo ""
-  read -p "Do you want to save this report to a file? [y/N]: " save_report
-  if [[ "$save_report" =~ ^[Yy]$ ]]; then
-    local report_file="git_status_report_$(date +%Y%m%d_%H%M%S).txt"
-    read -p "Enter filename [$report_file]: " custom_filename
-    report_file=${custom_filename:-$report_file}
-    
-    {
-      echo "Git Repository Status Report"
-      echo "Generated: $report_timestamp" 
-      echo "Scan Path: $base_path"
-      echo "=========================================="
-      echo ""
-      echo "SUMMARY:"
-      echo "- Total repositories: $total_repos"
-      echo "- Need updates: $needs_update"
-      echo "- Up-to-date: $up_to_date"
-      echo ""
-      
-      if [[ $needs_update -gt 0 ]]; then
-        echo "REPOSITORIES NEEDING UPDATES:"
-        echo "----------------------------------------"
-        for repo_info in "${needs_update_list[@]}"; do
-          IFS='|' read -r name path status <<< "$repo_info"
-          echo "[NEEDS UPDATE] $name - $status"
-          echo "   Path: $path"
-          echo ""
-        done
-      fi
-      
-      if [[ $up_to_date -gt 0 ]]; then
-        echo "REPOSITORIES UP-TO-DATE:"
-        echo "----------------------------------------"
-        for repo_info in "${up_to_date_list[@]}"; do
-          IFS='|' read -r name path branch last_commit <<< "$repo_info"
-          echo "[UP-TO-DATE] $name ($branch) - $last_commit"
-          echo "   Path: $path"
-          echo ""
-        done
-      fi
-      
-      echo "=========================================="
-      echo "Report generated by GitHub Repository Manager"
-    } > "$report_file"
-    
-    if [[ -f "$report_file" ]]; then
-      print_success "Report saved to: $report_file"
-    else
-      print_error "Failed to save report"
-    fi
-  fi
-}
 
 # Function to fix git repository ownership issues
 fix_git_ownership() {
@@ -1104,21 +492,11 @@ create_repository() {
   # Check if there are uncommitted changes
   if ! git diff --cached --exit-code >/dev/null; then
     print_status "Committing changes..."
-    local commit_cmd="git commit -m \"Initial commit - automated upload\""
-    if should_use_no_verify "$(pwd)"; then
-      commit_cmd="git commit --no-verify -m \"Initial commit - automated upload\""
-      print_status "Using --no-verify due to template variables or README passwords detected"
-    fi
-    eval "$commit_cmd"
+    git commit -m "Initial commit - automated upload"
   elif [ -n "$(git ls-files)" ] && [ -z "$(git log --oneline -1 2>/dev/null)" ]; then
     print_status "Creating initial commit..."
     git add .
-    local commit_cmd="git commit -m \"Initial commit - automated upload\""
-    if should_use_no_verify "$(pwd)"; then
-      commit_cmd="git commit --no-verify -m \"Initial commit - automated upload\""
-      print_status "Using --no-verify due to template variables or README passwords detected"
-    fi
-    eval "$commit_cmd"
+    git commit -m "Initial commit - automated upload"
   else
     print_status "Repository is already committed and up to date"
   fi
@@ -1165,188 +543,6 @@ create_repository() {
   fi
 
   # Push to GitHub
-  print_status "Pushing to GitHub..."
-  if git push -u origin main 2>/dev/null; then
-    print_success "Successfully pushed to GitHub!"
-  else
-    print_warning "Initial push failed. Attempting advanced push strategies..."
-    
-    # Try pushing with lease protection first
-    if git push --force-with-lease origin main 2>/dev/null; then
-      print_success "Successfully force-pushed to GitHub with lease protection!"
-    else
-      print_warning "Force push with lease failed. Trying credential helper method..."
-      # Try using credential helper
-      git config credential.helper store
-      echo "https://${gh_user}:${gh_token}@${github_url}" > ~/.git-credentials
-
-      if git push -u origin main 2>/dev/null; then
-        print_success "Successfully pushed to GitHub!"
-        # Clean up credentials
-        rm -f ~/.git-credentials
-        git config --unset credential.helper
-      elif git push --force-with-lease origin main 2>/dev/null; then
-        print_success "Successfully force-pushed to GitHub!"
-        # Clean up credentials
-        rm -f ~/.git-credentials
-        git config --unset credential.helper
-      else
-        print_error "Failed to push to GitHub. Please check your token permissions."
-        print_error "Make sure your token has 'repo' scope enabled."
-        rm -f ~/.git-credentials
-        git config --unset credential.helper 2>/dev/null || true
-        exit 1
-      fi
-    fi
-  fi
-
-  # Handle repository synchronization after initial push
-  if [[ "$http_code" == "422" ]]; then
-    print_status "Repository already exists. Attempting to synchronize..."
-    handle_repository_sync "$repo_url" "$gh_user" "$repo_name"
-  fi
-
-  # Clean up
-  rm -f /tmp/github_response.json
-
-  echo ""
-  echo "=========================================="
-  print_success "Project '$repo_name' has been successfully pushed to GitHub!"
-  echo "Repository URL: ${BLUE}https://$github_url/$gh_user/$repo_name${NC}"
-  echo "=========================================="
-}
-
-# Wrapper to call create_repository with a pre-filled project path
-create_repository_with_path() {
-  local project_path="$1"
-  echo ""
-  echo "GitHub Instance Configuration:"
-  echo " For GitHub.com: Just press Enter"
-  echo " For Enterprise: Enter domain only (e.g., github.company.com)"
-  echo ""
-
-  read -p "Enter GitHub domain (press Enter for github.com): " github_url
-  if [[ -z "$github_url" ]]; then
-    github_url="github.com"
-    api_url="https://api.github.com"
-  else
-    github_url=${github_url#https://}
-    github_url=${github_url#http://}
-    github_url=${github_url%/}
-    if [[ "$github_url" == "github.com" ]]; then
-      api_url="https://api.github.com"
-    else
-      api_url="https://$github_url/api/v3"
-    fi
-  fi
-
-  print_status "Using GitHub instance: ${BLUE}$github_url${NC}"
-  print_status "API endpoint: ${BLUE}$api_url${NC}"
-
-  # Use the supplied project path
-  local gh_user
-  read -p "Enter your GitHub username: " gh_user
-  local gh_token
-  read -s -p "Enter your GitHub personal access token: " gh_token
-  echo ""
-
-  if [[ -z "$project_path" || -z "$gh_user" || -z "$gh_token" ]]; then
-    print_error "All fields are required!"
-    exit 1
-  fi
-
-  # Extract repo name from the last folder in the path
-  repo_name=$(basename "$project_path")
-  repo_url="https://${gh_token}@${github_url}/$gh_user/$repo_name.git"
-
-  # Navigate to the project directory
-  print_status "Navigating to project directory: $project_path"
-  cd "$project_path" || {
-    print_error "Directory not found: $project_path"
-    exit 1
-  }
-
-  # Fix git ownership issues if they exist
-  fix_git_ownership "$project_path"
-
-  # Initialize Git repo if not already
-  if [ ! -d ".git" ]; then
-    print_status "Initializing Git repository..."
-    git init
-    git config init.defaultBranch main
-  else
-    print_status "Git repository already exists"
-  fi
-
-  # Setup git configuration
-  setup_git_config "$gh_user"
-
-  # Check if there are any files to commit
-  if git diff --cached --exit-code >/dev/null && git diff --exit-code >/dev/null && [ -z "$(git ls-files)" ]; then
-    print_warning "No files found to commit. Adding all files..."
-    git add .
-  fi
-
-  # Check if there are uncommitted changes
-  if ! git diff --cached --exit-code >/dev/null; then
-    print_status "Committing changes..."
-    local commit_cmd="git commit -m \"Initial commit - automated upload\""
-    if should_use_no_verify "$(pwd)"; then
-      commit_cmd="git commit --no-verify -m \"Initial commit - automated upload\""
-      print_status "Using --no-verify due to template variables or README passwords detected"
-    fi
-    eval "$commit_cmd"
-  elif [ -n "$(git ls-files)" ] && [ -z "$(git log --oneline -1 2>/dev/null)" ]; then
-    print_status "Creating initial commit..."
-    git add .
-    local commit_cmd="git commit -m \"Initial commit - automated upload\""
-    if should_use_no_verify "$(pwd)"; then
-      commit_cmd="git commit --no-verify -m \"Initial commit - automated upload\""
-      print_status "Using --no-verify due to template variables or README passwords detected"
-    fi
-    eval "$commit_cmd"
-  else
-    print_status "Repository is already committed and up to date"
-  fi
-
-  print_status "Creating GitHub repository: $repo_name"
-  response=$(curl -s -w "%{http_code}" -u "$gh_user:$gh_token" \
-    "$api_url/user/repos" \
-    -d "{\"name\":\"$repo_name\",\"private\":false}" \
-    -o /tmp/github_response.json)
-
-  http_code="${response: -3}"
-
-  if [[ "$http_code" == "201" ]]; then
-    print_success "GitHub repository created successfully!"
-  elif [[ "$http_code" == "422" ]]; then
-    if grep -q "name already exists" /tmp/github_response.json; then
-      print_warning "Repository already exists on GitHub. Continuing with push..."
-    else
-      print_error "Repository creation failed. Response:"
-      cat /tmp/github_response.json
-      exit 1
-    fi
-  else
-    print_error "Failed to create repository. HTTP Code: $http_code"
-    cat /tmp/github_response.json
-    exit 1
-  fi
-
-  if ! git remote get-url origin >/dev/null 2>&1; then
-    print_status "Adding remote origin..."
-    git remote add origin "$repo_url"
-  else
-    print_status "Remote origin already exists, updating URL..."
-    git remote set-url origin "$repo_url"
-  fi
-
-  current_branch=$(git branch --show-current)
-  if [[ "$current_branch" != "main" ]]; then
-    print_status "Switching to main branch..."
-    git branch -M main
-  fi
-
   print_status "Pushing to GitHub..."
   if git push -u origin main 2>/dev/null; then
     print_success "Successfully pushed to GitHub!"
@@ -1499,8 +695,8 @@ auto_commit_repositories() {
   echo ""
   
   # Get configuration from user
-  read -p "Enter base directory containing git repositories [${HOME}/Downloads/GIT]: " git_base_dir
-  git_base_dir=${git_base_dir:-"${HOME}/Downloads/GIT"}
+  read -p "Enter base directory containing git repositories [/home/{{ ansible_user }}/Downloads/GIT]: " git_base_dir
+  git_base_dir=${git_base_dir:-"/home/{{ ansible_user }}/Downloads/GIT"}
   
   if [[ ! -d "$git_base_dir" ]]; then
     print_error "Directory not found: $git_base_dir"
@@ -1607,31 +803,6 @@ dry_run_repos() {
   echo "  Repositories that would be updated: $repos_with_changes"
 }
 
-# Function to detect if --no-verify should be used for git commit
-should_use_no_verify() {
-  local repo_dir="$1"
-  
-  # Check for template variables containing "password" in staged files
-  if git diff --cached --name-only 2>/dev/null | xargs -I {} grep -l "{{.*password.*}}" {} 2>/dev/null | head -1 >/dev/null; then
-    return 0  # Use --no-verify
-  fi
-  
-  # Check for "password" in README files that are staged
-  if git diff --cached --name-only 2>/dev/null | grep -i "readme" | xargs -I {} grep -l "password" {} 2>/dev/null | head -1 >/dev/null; then
-    return 0  # Use --no-verify
-  fi
-  
-  # Check for Ansible/Jinja2 template variables in any staged files
-  if git diff --cached --name-only 2>/dev/null | xargs -I {} grep -l "{{.*}}" {} 2>/dev/null | head -1 >/dev/null; then
-    # If we find template variables, check if any contain common sensitive-looking keywords
-    if git diff --cached --name-only 2>/dev/null | xargs -I {} grep -l "{{.*\(password\|secret\|key\|token\).*}}" {} 2>/dev/null | head -1 >/dev/null; then
-      return 0  # Use --no-verify
-    fi
-  fi
-  
-  return 1  # Don't use --no-verify
-}
-
 # Function to execute auto-commit across repositories
 execute_auto_commit() {
   local base_dir="$1"
@@ -1691,23 +862,11 @@ execute_auto_commit() {
           fi
           
           # Perform git operations
-          if git add --all 2>/dev/null; then
-            # Check if we should use --no-verify
-            local commit_cmd="git commit -m \"$commit_msg\""
-            if should_use_no_verify "$(pwd)"; then
-              commit_cmd="git commit --no-verify -m \"$commit_msg\""
-              print_status "Using --no-verify due to template variables or README passwords detected"
-            fi
-            
-            if eval "$commit_cmd" 2>/dev/null && git push 2>/dev/null; then
-              print_success "Successfully committed and pushed: $dir_name"
-              return 0
-            else
-              print_error "Failed git operations for: $dir_name"
-              return 1
-            fi
+          if git add --all 2>/dev/null && git commit -m "$commit_msg" 2>/dev/null && git push 2>/dev/null; then
+            print_success "Successfully committed and pushed: $dir_name"
+            return 0
           else
-            print_error "Failed to add files for: $dir_name"
+            print_error "Failed git operations for: $dir_name"
             return 1
           fi
         else
@@ -2031,23 +1190,23 @@ apply_protection() {
       local pr_required=$(jq -r '.required_pull_request_reviews // empty' /tmp/github_protection_response.json)
       if [[ "$pr_required" != "" && "$pr_required" != "null" ]]; then
         local review_count=$(jq -r '.required_pull_request_reviews.required_approving_review_count' /tmp/github_protection_response.json)
-        echo "  [ENABLED] Pull Request Reviews: Required ($review_count approvals needed)"
+        echo "  ✅ Pull Request Reviews: Required ($review_count approvals needed)"
       else
-        echo "  [WARNING] Pull Request Reviews: Not required"
+        echo "  ⚠️  Pull Request Reviews: Not required"
       fi
       
       local status_checks=$(jq -r '.required_status_checks // empty' /tmp/github_protection_response.json)
       if [[ "$status_checks" != "" && "$status_checks" != "null" ]]; then
-        echo "  [ENABLED] Status Checks: Required"
+        echo "  ✅ Status Checks: Required"
       else
-        echo "  [WARNING] Status Checks: Not required"
+        echo "  ⚠️  Status Checks: Not required"
       fi
       
       local enforce_admins=$(jq -r '.enforce_admins.enabled' /tmp/github_protection_response.json)
       if [[ "$enforce_admins" == "true" ]]; then
-        echo "  [ENABLED] Admin Enforcement: Enabled"
+        echo "  ✅ Admin Enforcement: Enabled"
       else
-        echo "  [WARNING] Admin Enforcement: Disabled"
+        echo "  ⚠️  Admin Enforcement: Disabled"
       fi
       
     else
@@ -2110,6 +1269,12 @@ manage_pull_requests() {
     github_url=${github_url#https://}
     github_url=${github_url#http://}
     github_url=${github_url%/}
+    
+    if [[ "$github_url" == "github.com" ]]; then
+      api_url="https://api.github.com"
+    else
+      api_url="https://$github_url/api/v3"
+    fi
   fi
   
   echo ""
@@ -2167,7 +1332,7 @@ list_pull_requests() {
     echo ""
     
     if command -v jq >/dev/null 2>&1; then
-      jq -r '.[] | "PR #\(.number): \(.title)\n  Author: \(.user.login)\n  Branch: \(.head.ref) -> \(.base.ref)\n  Created: \(.created_at)\n  URL: \(.html_url)\n"' /tmp/github_prs_response.json
+      jq -r '.[] | "PR #\(.number): \(.title)\n  Author: \(.user.login)\n  Branch: \(.head.ref) → \(.base.ref)\n  Created: \(.created_at)\n  URL: \(.html_url)\n"' /tmp/github_prs_response.json
     else
       print_warning "jq not installed. Showing raw response:"
       cat /tmp/github_prs_response.json
@@ -2212,7 +1377,7 @@ get_pr_details() {
       echo "Title: $(jq -r '.title' /tmp/github_pr_details.json)"
       echo "Author: $(jq -r '.user.login' /tmp/github_pr_details.json)"
       echo "State: $(jq -r '.state' /tmp/github_pr_details.json)"
-      echo "Branch: $(jq -r '.head.ref' /tmp/github_pr_details.json) -> $(jq -r '.base.ref' /tmp/github_pr_details.json)"
+      echo "Branch: $(jq -r '.head.ref' /tmp/github_pr_details.json) → $(jq -r '.base.ref' /tmp/github_pr_details.json)"
       echo "Created: $(jq -r '.created_at' /tmp/github_pr_details.json)"
       echo "Updated: $(jq -r '.updated_at' /tmp/github_pr_details.json)"
       echo "Mergeable: $(jq -r '.mergeable // "unknown"' /tmp/github_pr_details.json)"
@@ -2513,7 +1678,6 @@ cleanup_repository_for_ga() {
   echo ""
   
   read -p "Do you want to proceed with cleanup? (y/N): " confirm
-  confirm=${confirm:-n}
   if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
     print_status "Cleanup cancelled"
     return 0
@@ -2552,7 +1716,6 @@ cleanup_repository_for_ga() {
   
   # 3. Clean git history
   read -p "Do you want to clean git history (remove all commits and start fresh)? (y/N): " clean_history
-  clean_history=${clean_history:-n}
   if [[ "$clean_history" =~ ^[Yy]$ ]]; then
     clean_git_history "$repo_path"
   fi
@@ -2749,12 +1912,7 @@ clean_git_history() {
   
   # Add all files and create initial commit
   git add .
-  local commit_cmd="git commit -m \"Initial commit - cleaned for GA release\""
-  if should_use_no_verify "$(pwd)"; then
-    commit_cmd="git commit --no-verify -m \"Initial commit - cleaned for GA release\""
-    print_status "Using --no-verify due to template variables or README passwords detected"
-  fi
-  eval "$commit_cmd"
+  git commit -m "Initial commit - cleaned for GA release"
   
   print_success "Git history cleaned and reset with initial commit"
 }
@@ -3086,7 +2244,7 @@ clone_repository() {
       return 0
     fi
   fi
-
+  
   # Choose clone method
   echo ""
   print_status "Clone method options:"
@@ -3823,95 +2981,75 @@ echo " GitHub Repository Manager v4.2.3"
 echo "=========================================="
 echo ""
 echo "Choose an action:"
-echo "1) Repository Operations"
-echo "2) Bulk Operations"
-echo "3) Status & Reports"
-echo "4) Maintenance & Cleanup"
-echo "5) Exit"
+echo "1) Auto-commit & push multiple repositories"
+echo "2) Bulk clone all user repositories (organized by user)"
+echo "3) Check GitHub API rate limits"
+echo "4) Cleanup repository for GA release (with backup)"
+echo "5) Clone existing repository"
+echo "6) Create new repository"
+echo "7) Delete repository (GitHub + Local)"
+echo "8) Fix git repository issues"
+echo "9) Manage pull requests (list, merge, close)"
+echo "10) Manage repository secrets"
+echo "11) Restore repository from backup"
+echo "12) Scan folders for git repositories" 
+echo "13) Set up repository branch protection"
+echo "14) Exit"
 echo ""
-read -p "Enter your choice (1-5): " main_choice
+read -p "Enter your choice (1-14): " choice
 
-case $main_choice in
+case $choice in
   1)
-    echo ""
-    echo "Repository Operations:"
-    echo "  1) Create new repository"
-    echo "  2) Clone existing repository"
-    echo "  3) Delete repository (GitHub + Local)"
-    echo "  4) Restore repository from backup"
-    echo "  5) Fix git repository issues"
-    echo "  6) Manage pull requests (list, merge, close)"
-    echo "  7) Manage repository secrets"
-    echo "  8) Set up branch protection"
-    echo "  9) Back"
-    read -p "Enter your choice (1-9): " repo_choice
-    case $repo_choice in
-      1) create_repository ;;
-      2) clone_repository ;;
-      3) remove_repository ;;
-      4) restore_repository_backup ;;
-      5) fix_git_issues ;;
-      6) manage_pull_requests ;;
-      7) manage_repository_secrets ;;
-      8) protect_repository ;;
-      9) ;;
-      *) print_error "Invalid choice." ;;
-    esac
+    auto_commit_repositories
     ;;
   2)
-    echo ""
-    echo "Bulk Operations:"
-    echo "  1) Auto-commit & push multiple repositories"
-    echo "  2) Bulk clone all user repositories"
-    echo "  3) Scan folders for git repositories"
-    echo "  4) Scan for local git repos needing push"
-    echo "  5) Back"
-    read -p "Enter your choice (1-5): " bulk_choice
-    case $bulk_choice in
-      1) auto_commit_repositories ;;
-      2) clone_all_user_repositories ;;
-      3) check_folders_for_git_repos ;;
-      4) scan_and_push_git_repos ;;
-      5) ;;
-      *) print_error "Invalid choice." ;;
-    esac
+    clone_all_user_repositories
     ;;
   3)
-    echo ""
-    echo "Status & Reports:"
-    echo "  1) Generate quick repository status report"
-    echo "  2) Check GitHub API rate limits"
-    echo "  3) Back"
-    read -p "Enter your choice (1-3): " status_choice
-    case $status_choice in
-      1) generate_repository_report ;;
-      2)
-        read -p "Enter GitHub API URL (press Enter for api.github.com): " api_url
-        api_url=${api_url:-"https://api.github.com"}
-        gh_token=$(secure_get_token)
-        if [[ -n "$gh_token" ]]; then
-          check_api_rate_limits "$api_url" "$gh_token"
-        else
-          print_error "GitHub token required to check rate limits"
-        fi
-        ;;
-      3) ;;
-      *) print_error "Invalid choice." ;;
-    esac
+    read -p "Enter GitHub API URL (press Enter for api.github.com): " api_url
+    api_url=${api_url:-"https://api.github.com"}
+    gh_token=$(secure_get_token)
+    if [[ -n "$gh_token" ]]; then
+      check_api_rate_limits "$api_url" "$gh_token"
+    else
+      print_error "GitHub token required to check rate limits"
+    fi
     ;;
   4)
-    echo ""
-    echo "Maintenance & Cleanup:"
-    echo "  1) Cleanup repository for GA release (with backup)"
-    echo "  2) Back"
-    read -p "Enter your choice (1-2): " maint_choice
-    case $maint_choice in
-      1) cleanup_repository_for_ga ;;
-      2) ;;
-      *) print_error "Invalid choice." ;;
-    esac
+    cleanup_repository_for_ga
     ;;
   5)
+    clone_repository
+    ;;
+  6)
+    echo ""
+    echo "=========================================="
+    echo " GitHub Project Creation"
+    echo "=========================================="
+    create_repository
+    ;;
+  7)
+    remove_repository
+    ;;
+  8)
+    fix_git_issues
+    ;;
+  9)
+    manage_pull_requests
+    ;;
+  10)
+    manage_repository_secrets
+    ;;
+  11)
+    restore_repository_backup
+    ;;
+  12)
+    check_folders_for_git_repos
+    ;;
+  13)
+    protect_repository
+    ;;
+  14)
     print_status "Goodbye!"
     exit 0
     ;;

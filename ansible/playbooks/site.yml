@@ -1,6 +1,6 @@
 ---
 - name: GitHubRepoManager playbook
-  hosts: localhost
+- hosts: localhost
   connection: local
   become: true
 
